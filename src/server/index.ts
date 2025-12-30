@@ -7,21 +7,46 @@ import {
   PauseKey,
 } from "../internal/routing/routing.js";
 import { getInput, printServerHelp } from "../internal/gamelogic/gamelogic.js";
-import { declareAndBind, SimpleQueueType } from "../internal/pubsub/consume.js";
+import {
+  SimpleQueueType,
+  subscribeMsgPack,
+  AckType,
+} from "../internal/pubsub/consume.js";
+import { writeLog, type GameLog } from "../internal/gamelogic/logs.js";
+
+async function handlerLog(gameLog: GameLog): Promise<AckType> {
+  try {
+    await writeLog(gameLog);
+    return AckType.Ack;
+  } catch (err) {
+    console.error("Error writing log:", err);
+    return AckType.NackDiscard;
+  } finally {
+    process.stdout.write("> ");
+  }
+}
 
 async function main() {
   const connectionString = "amqp://guest:guest@localhost:5672/";
   const connection = await amqp.connect(connectionString);
   console.log("Starting Peril server...");
-  printServerHelp();
 
-  await declareAndBind(
+  await subscribeMsgPack(
     connection,
     ExchangePerilTopic,
     GameLogSlug,
     `${GameLogSlug}.*`,
-    SimpleQueueType.Durable
+    SimpleQueueType.Durable,
+    handlerLog
   );
+
+  // Used to run the server from a non-interactive source, like the multiserver.sh file
+  if (!process.stdin.isTTY) {
+    console.log("Non-interactive mode: skipping command input.");
+    return;
+  }
+
+  printServerHelp();
 
   const confirmChannel = await connection.createConfirmChannel();
 
