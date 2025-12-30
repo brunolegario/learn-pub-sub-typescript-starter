@@ -1,5 +1,6 @@
 import amqp, { type Channel } from "amqplib";
 import { ExchangePerilDeadLetter } from "../routing/routing.js";
+import { decode } from "@msgpack/msgpack";
 
 export enum SimpleQueueType {
   Durable,
@@ -34,13 +35,14 @@ export async function declareAndBind(
   return [ch, queue];
 }
 
-export async function subscribeJSON<T>(
+export async function subscribe<T>(
   conn: amqp.ChannelModel,
   exchange: string,
   queueName: string,
   key: string,
   queueType: SimpleQueueType,
-  handler: (data: T) => AckType | Promise<AckType>
+  handler: (data: T) => AckType | Promise<AckType>,
+  unmarshaller: (data: Buffer) => T
 ): Promise<void> {
   const [channel, queue] = await declareAndBind(
     conn,
@@ -50,6 +52,8 @@ export async function subscribeJSON<T>(
     queueType
   );
 
+  await channel.prefetch(10);
+
   await channel.consume(
     queue.queue,
     async (msg: amqp.ConsumeMessage | null) => {
@@ -57,7 +61,7 @@ export async function subscribeJSON<T>(
 
       let data: T;
       try {
-        data = JSON.parse(msg.content.toString()) as T;
+        data = unmarshaller(msg.content);
       } catch (err) {
         console.error("Error parsing JSON message:", err);
         return;
@@ -68,15 +72,12 @@ export async function subscribeJSON<T>(
         switch (ack) {
           case AckType.Ack:
             channel.ack(msg);
-            console.log("Message acknowledged.");
             break;
           case AckType.NackRequeue:
             channel.nack(msg, false, true);
-            console.log("Message not acknowledged, requeued.");
             break;
           case AckType.NackDiscard:
             channel.nack(msg, false, false);
-            console.log("Message not acknowledged, discarded.");
             break;
           default:
             const unreachable: never = ack;
@@ -89,5 +90,37 @@ export async function subscribeJSON<T>(
         return;
       }
     }
+  );
+}
+
+export function subscribeJSON<T>(
+  conn: amqp.ChannelModel,
+  exchange: string,
+  queueName: string,
+  key: string,
+  queueType: SimpleQueueType,
+  handler: (data: T) => AckType | Promise<AckType>
+): Promise<void> {
+  return subscribe(conn, exchange, queueName, key, queueType, handler, (data) =>
+    JSON.parse(data.toString())
+  );
+}
+
+export function subscribeMsgPack<T>(
+  conn: amqp.ChannelModel,
+  exchange: string,
+  queueName: string,
+  key: string,
+  queueType: SimpleQueueType,
+  handler: (data: T) => AckType | Promise<AckType>
+): Promise<void> {
+  return subscribe(
+    conn,
+    exchange,
+    queueName,
+    key,
+    queueType,
+    handler,
+    (data) => decode(data) as T
   );
 }
