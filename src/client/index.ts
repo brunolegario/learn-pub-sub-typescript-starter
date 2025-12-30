@@ -1,8 +1,9 @@
-import amqp, { type ConfirmChannel } from "amqplib";
+import amqp, { type ConfirmChannel, type Channel } from "amqplib";
 import {
   clientWelcome,
   commandStatus,
   getInput,
+  getMaliciousLog,
   printClientHelp,
   printQuit,
 } from "../internal/gamelogic/gamelogic.js";
@@ -15,6 +16,7 @@ import {
   ArmyMovesPrefix,
   ExchangePerilDirect,
   ExchangePerilTopic,
+  GameLogSlug,
   PauseKey,
   WarRecognitionsPrefix,
 } from "../internal/routing/routing.js";
@@ -29,12 +31,13 @@ import {
   MoveOutcome,
 } from "../internal/gamelogic/move.js";
 import { handlePause } from "../internal/gamelogic/pause.js";
-import { publishJSON } from "../internal/pubsub/publish.js";
+import { publishJSON, publishMsgPack } from "../internal/pubsub/publish.js";
 import type {
   ArmyMove,
   RecognitionOfWar,
 } from "../internal/gamelogic/gamedata.js";
 import { handleWar, WarOutcome } from "../internal/gamelogic/war.js";
+import type { GameLog } from "../internal/gamelogic/logs.js";
 
 function handlerPause(gs: GameState): (ps: PlayingState) => AckType {
   return (ps: PlayingState) => {
@@ -82,7 +85,10 @@ function handlerMove(
   };
 }
 
-function handlerWar(gs: GameState): (rw: RecognitionOfWar) => Promise<AckType> {
+function handlerWar(
+  gs: GameState,
+  ch: ConfirmChannel
+): (rw: RecognitionOfWar) => Promise<AckType> {
   return async (rw: RecognitionOfWar) => {
     try {
       const resolution = handleWar(gs, rw);
@@ -94,8 +100,30 @@ function handlerWar(gs: GameState): (rw: RecognitionOfWar) => Promise<AckType> {
           return AckType.NackDiscard;
         case WarOutcome.OpponentWon:
         case WarOutcome.YouWon:
+          try {
+            await publishGameLog(
+              ch,
+              gs.getUsername(),
+              `${resolution.winner} won a war against ${resolution.loser}`
+            );
+
+            return AckType.Ack;
+          } catch (err) {
+            console.error("Error publishing game log:", err);
+            return AckType.NackRequeue;
+          }
         case WarOutcome.Draw:
-          return AckType.Ack;
+          try {
+            await publishGameLog(
+              ch,
+              gs.getUsername(),
+              `A war between ${resolution.attacker} and ${resolution.defender} resulted in a draw`
+            );
+            return AckType.Ack;
+          } catch (err) {
+            console.error("Error publishing game log:", err);
+            return AckType.NackRequeue;
+          }
         default:
           const unreachable: never = resolution;
           console.log("Unknown WarResolution:", unreachable);
@@ -105,6 +133,52 @@ function handlerWar(gs: GameState): (rw: RecognitionOfWar) => Promise<AckType> {
       process.stdout.write("> ");
     }
   };
+}
+
+async function publishGameLog(
+  ch: ConfirmChannel,
+  username: string,
+  msg: string
+) {
+  const gamelog: GameLog = {
+    username: username,
+    message: msg,
+    currentTime: new Date(),
+  };
+
+  await publishMsgPack(
+    ch,
+    ExchangePerilTopic,
+    `${GameLogSlug}.${username}`,
+    gamelog
+  );
+}
+
+function handlerSpam(ch: ConfirmChannel, username: string, inputs: string[]) {
+  if (inputs.length < 2) {
+    console.log("usage: spam <n>");
+    return;
+  }
+  const raw = inputs[1];
+  if (!raw) {
+    console.log("usage: spam <n>");
+    return;
+  }
+  const n = parseInt(raw, 10);
+  if (isNaN(n)) {
+    console.log(`error: ${inputs[1]} is not a valid number`);
+    return;
+  }
+
+  for (let i = 0; i < n; i++) {
+    try {
+      const log = getMaliciousLog();
+      publishGameLog(ch, username, log);
+    } catch (err) {
+      console.error("Error publishing spam log:", (err as Error).message);
+      continue;
+    }
+  }
 }
 
 async function main() {
@@ -140,7 +214,7 @@ async function main() {
     WarRecognitionsPrefix,
     `${WarRecognitionsPrefix}.*`,
     SimpleQueueType.Durable,
-    handlerWar(gameState)
+    handlerWar(gameState, channel)
   );
 
   while (true) {
@@ -174,7 +248,13 @@ async function main() {
     } else if (command === "help") {
       printClientHelp();
     } else if (command === "spam") {
-      console.log("Spamming is not allowed yet!");
+      try {
+        handlerSpam(channel, username, inputs);
+      } catch (err) {
+        console.log((err as Error).message);
+      } finally {
+        continue;
+      }
     } else if (command === "quit") {
       printQuit();
       process.exit(0);
